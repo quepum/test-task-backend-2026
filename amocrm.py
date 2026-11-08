@@ -1,5 +1,8 @@
+"""Клиент AmoCRM и разбор ответов API."""
+
+import copy
 import time
-from typing import Type, Any, Iterator
+from typing import Any, Dict, Iterator, List, Type
 
 import requests
 
@@ -19,6 +22,10 @@ EVENTS = "events"
 
 class AmoCrmRepeatError(Exception):
     """Надо ещё раз запрос кинуть"""
+
+    def __init__(self, retry_after=None):
+        self.retry_after = retry_after
+        super().__init__(f"retry after {retry_after}" if retry_after else "retry")
 
 
 class AmoCrmNoConten(Exception):
@@ -54,9 +61,45 @@ class AmoCrmError(Exception):
 
 
 class AmoCrmCompaniesMoreThanOne(Exception):
+    """Найдено больше одной компании."""
+
+
+def normalize_custom_fields(raw_fields: Any) -> Dict[str, Dict[str, Any]]:
+    """Приводит custom_fields_values AmoCRM к словарю {имя поля: {id, value}}.
+
+    Понимает и реальный список полей AmoCRM, и уже нормализованный словарь.
     """
-    amocrm error when found companies > 1
-    """
+    if not raw_fields:
+        return {}
+    if isinstance(raw_fields, dict):
+        return dict(raw_fields)
+    if not isinstance(raw_fields, list):
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for item in raw_fields:
+        if not isinstance(item, dict):
+            continue
+        name = item.get('field_name') or item.get('field_code') or item.get('name')
+        if not name:
+            continue
+
+        values = item.get('values')
+        if isinstance(values, list) and values:
+            first = values[0]
+            value = first.get('value') if isinstance(first, dict) else first
+        else:
+            value = item.get('value')
+
+        result[name] = {'id': item.get('field_id') or item.get('id'), 'value': value}
+    return result
+
+
+def _embedded_items(embedded: Any, key: str) -> List[Any]:
+    if not isinstance(embedded, dict):
+        return []
+    items = embedded.get(key)
+    return items if isinstance(items, list) else []
 
 
 class BaseEntity:
@@ -68,17 +111,31 @@ class BaseEntity:
     url = None
     custom_fields_values = None
     PATCH_FIELDS = None
+    FIELDS = ()
 
     def __str__(self):
-        return f"<{type(self).__name__}: {self.name}, {self.id}>"
+        return f"<{type(self).__name__}: {getattr(self, 'name', None)}, {getattr(self, 'id', None)}>"
 
     def __repr__(self):
         return str(self)
 
     def get_field(self, field_name):
-        return self.custom_fields_values.get(field_name, {}).get('value')
+        """Возвращает значение кастомного поля по имени."""
+        field = (self.custom_fields_values or {}).get(field_name)
+        if isinstance(field, dict):
+            return field.get('value')
+        return field
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Возвращает JSON-совместимый словарь для колонки data."""
+        return copy.deepcopy({
+            name: getattr(self, name, None) for name in self.FIELDS
+        })
 
     def set_field(self, field_name, field_value, field_id=None):
+        """Записывает значение кастомного поля."""
+        if self.custom_fields_values is None:
+            self.custom_fields_values = {}
         custom_field = self.custom_fields_values.get(field_name)
         if custom_field is None:
             if field_id is None:
@@ -94,6 +151,7 @@ class BaseEntity:
             raise ValueError(f"Custom field {field_name} without id")
 
     def get_url(self):
+        """Возвращает URL сущности в API."""
         return self.url
 
 
@@ -103,6 +161,22 @@ class Customer(BaseEntity):
     """
     url = "api/v4/customers"
     entity_name = CUSTOMERS
+    FIELDS = (
+        'id', 'name', 'next_price', 'next_date', 'responsible_user_id',
+        'status_id', 'periodicity', 'created_by', 'updated_by', 'created_at',
+        'updated_at', 'closest_task_at', 'is_deleted', 'ltv',
+        'purchases_count', 'average_check', 'account_id', 'custom_fields_values',
+    )
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "Customer":
+        """Создаёт покупателя из JSON-объекта AmoCRM."""
+        data = payload if isinstance(payload, dict) else {}
+        embedded = data.get('_embedded')
+        return cls(
+            **{field: data.get(field) for field in cls.FIELDS},
+            _embedded=embedded if isinstance(embedded, dict) else None,
+        )
 
     def __init__(self,
                  id,
@@ -142,18 +216,14 @@ class Customer(BaseEntity):
         self.purchases_count = purchases_count
         self.average_check = average_check
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = normalize_custom_fields(custom_fields_values)
         self._embedded = _embedded
 
         self.companies = []
         self.contacts = []
         self._new_next_date = None
-        if not _embedded:
-            return
-        if _embedded.get(COMPANIES):
-            self.companies = _embedded.get(COMPANIES)
-        if _embedded.get(CONTACTS):
-            self.contacts = _embedded.get(CONTACTS)
+        self.companies = _embedded_items(_embedded, COMPANIES)
+        self.contacts = _embedded_items(_embedded, CONTACTS)
 
 
 class Lead(BaseEntity):
@@ -163,6 +233,22 @@ class Lead(BaseEntity):
     url = "api/v4/leads"
     entity_name = LEADS
     PATCH_FIELDS = ("custom_fields_values", "id")
+    FIELDS = (
+        'id', 'name', 'price', 'responsible_user_id', 'group_id', 'status_id',
+        'pipeline_id', 'source_id', 'created_by', 'updated_by', 'created_at',
+        'updated_at', 'closest_task_at', 'is_deleted', 'score', 'account_id',
+        'custom_fields_values',
+    )
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "Lead":
+        """Создаёт сделку из JSON-объекта AmoCRM."""
+        data = payload if isinstance(payload, dict) else {}
+        embedded = data.get('_embedded')
+        return cls(
+            **{field: data.get(field) for field in cls.FIELDS},
+            _embedded=embedded if isinstance(embedded, dict) else None,
+        )
 
     def __init__(self,
                  name=None,
@@ -200,13 +286,38 @@ class Lead(BaseEntity):
         self.is_deleted = is_deleted
         self.score = score
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = normalize_custom_fields(custom_fields_values)
         self._embedded = _embedded
-        self.tags = []
-        self.contacts = []
-        self.companies = []
-        if not _embedded:
-            return
+        self.tags = _embedded_items(_embedded, TAGS)
+        self.contacts = _embedded_items(_embedded, CONTACTS)
+        self.companies = _embedded_items(_embedded, COMPANIES)
+
+
+def extract_entities(json_data: Any, entity_name: str):
+    """Возвращает сущности страницы CRM, безопасно к пустому _embedded."""
+    if not isinstance(json_data, dict):
+        return []
+    embedded = json_data.get('_embedded')
+    if not isinstance(embedded, dict):
+        return []
+    entities = embedded.get(entity_name)
+    if not isinstance(entities, list):
+        return []
+    return entities
+
+
+def get_next_href(json_data: Any):
+    """Возвращает ссылку на следующую страницу или None."""
+    if not isinstance(json_data, dict):
+        return None
+    links = json_data.get('_links')
+    if not isinstance(links, dict):
+        return None
+    next_link = links.get('next')
+    if not isinstance(next_link, dict):
+        return None
+    href = next_link.get('href')
+    return href if isinstance(href, str) and href else None
 
 
 def amocrm_get(obj_cls: Type[BaseEntity],
@@ -215,7 +326,9 @@ def amocrm_get(obj_cls: Type[BaseEntity],
                _filter: dict = None,
                _with: str = None,
                query: Any = None,
-               custom_filter: dict = None) -> Iterator[BaseEntity]:
+               custom_filter: dict = None,
+               max_attempts: int = 5) -> Iterator[BaseEntity]:
+    """Постранично отдаёт сущности AmoCRM с повторами на 429/5xx и сетевые ошибки."""
     params = {}
     if page:
         params['page'] = page
@@ -233,69 +346,80 @@ def amocrm_get(obj_cls: Type[BaseEntity],
         else:
             params['with'] = _with
     if query:
-        params[f'query'] = query
+        params['query'] = query
 
     headers = {}
     base_url = ""
     url = f"{base_url}{obj_cls.url}"
     entity_name = obj_cls.entity_name
-    schema = obj_cls.get_schema(many=True)
+    factory = getattr(obj_cls, 'from_dict', None)
 
     while True:
-        response = None
         json_data = None
-        try:
-            for try_attempt in range(4):  # 0..3 — до 4 попыток на один запрос
-                try:
-                    response = requests.get(url, params=params, headers=headers, timeout=120)
-                    json_data = response_handler(response)
-                    break
-                except AmoCrmRepeatError as e:
-                    if try_attempt >= 3:
-                        raise e
-                    # повторить тот же запрос (тот же url, params), без нового get() с начала
-                except AmoCrmNoConten:
+        attempt = 0
+        while True:
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=120)
+                json_data = response_handler(response)
+                break
+            except AmoCrmNoConten:
+                return
+            except AmoCrmRepeatError as exc:
+                attempt += 1
+                if attempt >= max_attempts:
                     raise
-                except Exception as e:
-                    raise AmoCrmError(f"[!] {response.status_code if response else '<No code!>'} |"
-                                      f" Неожиданная AMOCRM ошибка {e} ") from e
-        except AmoCrmNoConten:
-            break
-        if json_data is not None:
-            counter = 0
-            for entity in schema.load(json_data['_embedded'][entity_name]):
-                counter += 1
-                skip_entity = False
-                if custom_filter:
-                    # if custom filter is not None then check custom field,
-                    # if at least one not equal filter, set skip_entity value True and break checker
-                    #
-                    for key, value in custom_filter.items():
-                        if entity.get_field(key) != value:
-                            skip_entity = True
-                            break
-                # check if should pass entity
-                if skip_entity:
-                    pass
-                else:
-                    yield entity
+                delay = exc.retry_after or min(2 ** attempt, 30)
+                time.sleep(delay)
+            except requests.exceptions.RequestException as exc:
+                attempt += 1
+                if attempt >= max_attempts:
+                    raise AmoCrmError(f"Сетевая ошибка AmoCRM: {exc}") from exc
+                time.sleep(min(2 ** attempt, 30))
 
-            # condition to stop while loop
-            if page:
-                break
-            if counter < limit:
-                break
-            time.sleep(1)
-            # reset url and params for page iteration
-            url = json_data['_links']['next']['href']
-            params = {}
+        raw_entities = extract_entities(json_data, entity_name)
+        if callable(factory):
+            loaded_entities = [factory(raw) for raw in raw_entities]
+        else:
+            loaded_entities = raw_entities
+        for entity in loaded_entities:
+            skip_entity = False
+            if custom_filter:
+                for key, value in custom_filter.items():
+                    if entity.get_field(key) != value:
+                        skip_entity = True
+                        break
+            if not skip_entity:
+                yield entity
+
+        if page:
+            break
+        # Идём по курсору, а не по размеру страницы: AmoCRM может вернуть
+        # меньше записей и всё равно иметь следующую страницу. Без пауз.
+        next_href = get_next_href(json_data)
+        if not raw_entities or not next_href:
+            break
+        url = next_href
+        params = {}
 
 
 def response_handler(response):
+    """Проверяет ответ CRM и возвращает JSON; на 429/5xx просит повтор."""
     if response.status_code == 204:
-        raise AmoCrmNoConten(f"no content for {response.url}, method: {response.request.method}")
+        method = getattr(getattr(response, 'request', None), 'method', 'GET')
+        raise AmoCrmNoConten(
+            f"no content for {getattr(response, 'url', '')}, method: {method}"
+        )
     elif response.status_code == 429:
-        time.sleep(2)
+        retry_after = None
+        headers = getattr(response, 'headers', None) or {}
+        raw_retry_after = headers.get('Retry-After') if hasattr(headers, 'get') else None
+        if raw_retry_after:
+            try:
+                retry_after = float(raw_retry_after)
+            except (TypeError, ValueError):
+                retry_after = None
+        raise AmoCrmRepeatError(retry_after=retry_after)
+    elif 500 <= response.status_code < 600:
         raise AmoCrmRepeatError()
     elif response.status_code != 200:
         json_data = {}
